@@ -1,14 +1,15 @@
 """The OAuth Codex backend (the v1 preferred runtime route).
 
 Consumes the user's existing Codex/ChatGPT auth from ``~/.codex/auth.json`` and calls the Codex
-backend endpoint, which is OpenAI-Responses-shaped and stateless (we resend the full history each
-call). Credentials are password-equivalent: the access token is never logged (``repr=False``) and
-never persisted by us.
+backend's Responses endpoint, which is stateless (we resend the full history each call) and streams
+the answer as Server-Sent Events. Credentials are password-equivalent: the access token is never
+logged (``repr=False``) and never persisted by us.
 
-This route is UNOFFICIAL and can change. The wire details below (endpoint, header names, default
-model, response shape) are isolated into named constants/methods and MUST be validated against the
-current Codex backend before relying on the live path. The structure, auth loading, error mapping,
-and request shaping are unit-tested with mocked HTTP and a temp auth file.
+This route is UNOFFICIAL and can change. The wire details below were validated live against the
+current Codex backend (June 2026): endpoint ``/backend-api/codex/responses``; ChatGPT-account
+models are ``gpt-5.5`` / ``gpt-5.4`` / ``gpt-5.4-mini`` (NOT the ``*-codex`` names -- those are
+rejected for ChatGPT accounts); the answer text accumulates from ``response.output_text.delta``
+SSE events. They may need revalidation after a Codex update.
 """
 
 from __future__ import annotations
@@ -28,12 +29,21 @@ from ai_professor.provider.adapter import (
     TransportError,
 )
 
-# --- wire constants (per the documented Codex pattern; validate live before trusting) ----------
+# --- wire constants (validated live; revalidate after a Codex update) --------------------------
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 RESPONSES_PATH = "/responses"
-ACCOUNT_HEADER = "chatgpt-account-id"
-CODEX_DEFAULT_MODEL = "gpt-5.1-codex"
-DEFAULT_TIMEOUT_S = 60.0
+ACCOUNT_HEADER = "ChatGPT-Account-ID"  # casing matches the Codex CLI (header is case-insensitive)
+CODEX_DEFAULT_MODEL = "gpt-5.5"
+# Models the ChatGPT-account Codex route exposes (from GET /codex/models). codex-auto-review is a
+# special-purpose model and is intentionally omitted from the general-use set.
+SUPPORTED_MODELS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
+DEFAULT_TIMEOUT_S = 120.0
+_STATIC_HEADERS = {
+    "OpenAI-Beta": "responses=experimental",
+    "originator": "codex_cli_rs",
+    "User-Agent": "codex_cli_rs/0.0.0",
+    "Accept": "text/event-stream",
+}
 
 
 def default_codex_auth_path() -> Path:
@@ -72,6 +82,51 @@ def load_codex_auth(path: Path) -> CodexAuth | None:
     return CodexAuth(access_token=access_token, account_id=str(account_id))
 
 
+def _content_part_type(role: str) -> str:
+    # Responses-API input items: prior assistant turns use output_text, everything else input_text.
+    return "output_text" if role == "assistant" else "input_text"
+
+
+def parse_sse_text(sse: str) -> str:
+    """Assemble the answer text from a Responses SSE stream (output_text.delta events)."""
+    parts: list[str] = []
+    completed_text: str | None = None
+    for line in sse.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type")
+        if etype == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                parts.append(delta)
+        elif etype == "response.completed":
+            completed_text = _text_from_response(event.get("response", {}))
+        elif etype in ("response.failed", "response.error", "error"):
+            detail = event.get("response", {}).get("error") or event.get("error") or "stream error"
+            raise TransportError(f"Codex stream error: {detail}")
+    if parts:
+        return "".join(parts)
+    if completed_text is not None:
+        return completed_text
+    raise TransportError("Codex returned no output text")
+
+
+def _text_from_response(response: dict[str, Any]) -> str | None:
+    for item in response.get("output", []):
+        if item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                    return str(c["text"])
+    return None
+
+
 class CodexBackend:
     """Backend that calls the Codex Responses endpoint with the user's OAuth credentials."""
 
@@ -102,25 +157,36 @@ class CodexBackend:
         headers = {
             "Authorization": f"Bearer {auth.access_token}",
             "Content-Type": "application/json",
+            **_STATIC_HEADERS,
         }
         if auth.account_id:
             headers[ACCOUNT_HEADER] = auth.account_id
         payload = self._build_payload(request)
         url = f"{self._base_url}{RESPONSES_PATH}"
         if self._client is not None:
-            data = self._post(self._client, url, payload, headers)
+            sse = self._post(self._client, url, payload, headers)
         else:
             with httpx.Client(timeout=self._timeout) as client:
-                data = self._post(client, url, payload, headers)
-        return Completion(
-            text=self._parse_text(data), model=str(payload["model"]), backend=self.name
-        )
+                sse = self._post(client, url, payload, headers)
+        return Completion(text=parse_sse_text(sse), model=str(payload["model"]), backend=self.name)
 
     def _build_payload(self, request: CompletionRequest) -> dict[str, Any]:
+        system = "\n\n".join(m.content for m in request.messages if m.role == "system")
         payload: dict[str, Any] = {
             "model": request.model or self._model,
-            "input": [{"role": m.role, "content": m.content} for m in request.messages],
+            "input": [
+                {
+                    "role": m.role,
+                    "content": [{"type": _content_part_type(m.role), "text": m.content}],
+                }
+                for m in request.messages
+                if m.role != "system"
+            ],
+            "stream": True,
+            "store": False,
         }
+        if system:
+            payload["instructions"] = system
         if request.max_tokens is not None:
             payload["max_output_tokens"] = request.max_tokens
         if request.temperature is not None:
@@ -133,7 +199,7 @@ class CodexBackend:
         url: str,
         payload: dict[str, Any],
         headers: dict[str, str],
-    ) -> dict[str, Any]:
+    ) -> str:
         try:
             resp = client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
@@ -144,18 +210,7 @@ class CodexBackend:
         if code in (408, 429) or code >= 500:
             raise TransportError(f"Codex HTTP {code}")  # transient/server -> fall back
         if code >= 400:
-            raise BadRequestError(f"Codex HTTP {code}")  # client error -> propagate (our bug)
-        parsed: dict[str, Any] = resp.json()
-        return parsed
-
-    def _parse_text(self, data: dict[str, Any]) -> str:
-        # Responses shape: output[] -> (type=message).content[] -> (type=output_text).text
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for part in item.get("content", []):
-                    if part.get("type") == "output_text":
-                        text = part.get("text", "")
-                        return text if isinstance(text, str) else ""
-        if isinstance(data.get("output_text"), str):  # SDK convenience field, if present
-            return str(data["output_text"])
-        raise TransportError("could not parse Codex response (unexpected shape)")
+            raise BadRequestError(
+                f"Codex HTTP {code}: {resp.text[:200]}"
+            )  # client error -> propagate
+        return resp.text

@@ -1,7 +1,7 @@
 """Tests for the Codex OAuth backend: auth loading, request shaping, parsing, error mapping.
 
 The live Codex endpoint is never contacted -- HTTP is mocked via ``httpx.MockTransport`` and
-credentials come from a temp file. (The real wire details still need live validation.)
+credentials come from a temp file. The mocked SSE mirrors the real (live-validated) protocol.
 """
 
 from __future__ import annotations
@@ -19,7 +19,22 @@ from ai_professor.provider.adapter import (
     Message,
     TransportError,
 )
-from ai_professor.provider.codex_oauth import CodexAuth, CodexBackend, load_codex_auth
+from ai_professor.provider.codex_oauth import (
+    CodexAuth,
+    CodexBackend,
+    load_codex_auth,
+    parse_sse_text,
+)
+
+# A Responses SSE stream mirroring the live protocol: text accumulates from output_text.delta.
+_SSE_HELLO = (
+    "event: response.output_text.delta\n"
+    'data: {"type": "response.output_text.delta", "delta": "Hel"}\n\n'
+    "event: response.output_text.delta\n"
+    'data: {"type": "response.output_text.delta", "delta": "lo"}\n\n'
+    "event: response.completed\n"
+    'data: {"type": "response.completed", "response": {"status": "completed"}}\n\n'
+)
 
 
 def _write_auth(path: Path, **payload: object) -> Path:
@@ -71,35 +86,69 @@ def test_available_reflects_credentials(tmp_path: Path) -> None:
     assert absent.available() is False
 
 
-def test_complete_shapes_request_and_parses_response(tmp_path: Path) -> None:
+def test_complete_shapes_request_and_parses_sse(tmp_path: Path) -> None:
     auth = _write_auth(tmp_path, access_token="tok", account_id="acct")
     seen: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["auth"] = request.headers.get("Authorization")
-        seen["account"] = request.headers.get("chatgpt-account-id")
+        seen["account"] = request.headers.get("ChatGPT-Account-ID")
+        seen["originator"] = request.headers.get("originator")
         seen["body"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "output": [
-                    {"type": "message", "content": [{"type": "output_text", "text": "hello"}]}
-                ]
-            },
-        )
+        return httpx.Response(200, text=_SSE_HELLO)
 
     backend = CodexBackend(
         auth_path=auth, client=httpx.Client(transport=httpx.MockTransport(handler))
     )
     result = backend.complete(_req())
 
-    assert result.text == "hello"
+    assert result.text == "Hello"  # accumulated from output_text.delta events
     assert result.backend == "codex-oauth"
     assert str(seen["path"]).endswith("/responses")
     assert seen["auth"] == "Bearer tok"
     assert seen["account"] == "acct"
-    assert seen["body"] == {"model": "gpt-5.1-codex", "input": [{"role": "user", "content": "hi"}]}
+    assert seen["originator"] == "codex_cli_rs"  # required by the backend (403 otherwise)
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["model"] == "gpt-5.5"
+    assert body["stream"] is True
+    assert body["store"] is False
+    assert body["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_system_message_becomes_instructions(tmp_path: Path) -> None:
+    auth = _write_auth(tmp_path, access_token="tok")
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, text=_SSE_HELLO)
+
+    backend = CodexBackend(
+        auth_path=auth, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    backend.complete(
+        CompletionRequest(
+            messages=[
+                Message(role="system", content="Be terse."),
+                Message(role="user", content="hi"),
+            ]
+        )
+    )
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["instructions"] == "Be terse."
+    assert all(item["role"] != "system" for item in body["input"])
+
+
+def test_parse_sse_text_accumulates_deltas() -> None:
+    assert parse_sse_text(_SSE_HELLO) == "Hello"
+
+
+def test_parse_sse_text_raises_when_no_output() -> None:
+    with pytest.raises(TransportError):
+        parse_sse_text('event: response.created\ndata: {"type": "response.created"}\n\n')
 
 
 def test_complete_without_auth_raises(tmp_path: Path) -> None:
