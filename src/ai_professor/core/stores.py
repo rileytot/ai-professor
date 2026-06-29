@@ -5,10 +5,18 @@
 3. Event log      -- append-only audit trail.
 
 They share one SQLite database but are logically distinct with different immutability needs.
-**Append-only and immutability are enforced at the database level via triggers** (not just the
-Python API), so even raw SQL ``UPDATE``/``DELETE`` is rejected. This makes invariant #1's
-"append-only ledger" and §7's "immutable curriculum" deterministic guarantees rather than
-conventions the calling code must remember to honor.
+**Mutation is blocked at the storage engine via triggers** (not just the Python API): raw
+``UPDATE``, ``DELETE``, and ``INSERT OR REPLACE`` (whose conflict-delete does not fire BEFORE
+DELETE triggers) against the event log or an existing curriculum version are all rejected. This
+makes invariant #1's "append-only ledger" and §7's "immutable curriculum" deterministic
+guarantees rather than conventions the caller must remember.
+
+Honest limits: triggers cannot intercept DDL, so a ``DROP TABLE`` by a sufficiently privileged
+caller can destroy a table wholesale -- but that is *loud* (the data is gone), not a *silent* edit
+of a single record, which the triggers do prevent. ``connect`` additionally detects a database
+whose guard triggers were stripped (the drop-triggers-then-mutate attack) and refuses to open it,
+giving cross-session tamper-evidence. A hash-chained log for stronger, in-session tamper-evidence
+is a post-v1 option.
 """
 
 from __future__ import annotations
@@ -21,7 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from ai_professor.core.errors import CurriculumImmutableError
+from ai_professor.core.errors import CurriculumImmutableError, IntegrityError
 from ai_professor.core.events import DomainEvent, RecordedEvent, deserialize, serialize
 from ai_professor.core.projection import KnowledgeProjection
 
@@ -54,6 +62,11 @@ CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
     BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
     BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;
+-- ...and block INSERT OR REPLACE on an existing seq (its conflict-delete skips BEFORE DELETE).
+-- Normal appends never specify seq, so NEW.seq is a fresh AUTOINCREMENT value that cannot collide.
+CREATE TRIGGER IF NOT EXISTS events_no_replace BEFORE INSERT ON events
+    WHEN EXISTS (SELECT 1 FROM events WHERE seq = NEW.seq)
+    BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;
 
 CREATE TABLE IF NOT EXISTS curriculum (
     version    TEXT PRIMARY KEY,
@@ -66,13 +79,40 @@ CREATE TRIGGER IF NOT EXISTS curriculum_no_update BEFORE UPDATE ON curriculum
     BEGIN SELECT RAISE(ABORT, 'curriculum is immutable per version'); END;
 CREATE TRIGGER IF NOT EXISTS curriculum_no_delete BEFORE DELETE ON curriculum
     BEGIN SELECT RAISE(ABORT, 'curriculum is immutable per version'); END;
+CREATE TRIGGER IF NOT EXISTS curriculum_no_replace BEFORE INSERT ON curriculum
+    WHEN EXISTS (SELECT 1 FROM curriculum WHERE version = NEW.version)
+    BEGIN SELECT RAISE(ABORT, 'curriculum is immutable per version'); END;
 """
+
+# Guard triggers that must be present on a non-empty database (tamper-evidence; see connect()).
+_EVENT_GUARDS = ("events_no_update", "events_no_delete", "events_no_replace")
+_CURRICULUM_GUARDS = ("curriculum_no_update", "curriculum_no_delete", "curriculum_no_replace")
+
+
+def _detect_tampering(conn: sqlite3.Connection) -> None:
+    """Refuse to open a database whose tables exist but whose guard triggers were stripped.
+
+    This catches the drop-triggers-then-mutate attack across sessions. We check *before* the
+    schema is re-applied, since ``CREATE TRIGGER IF NOT EXISTS`` would otherwise silently restore
+    the guards and mask the tampering.
+    """
+    rows = conn.execute("SELECT type, name FROM sqlite_master").fetchall()
+    tables = {r["name"] for r in rows if r["type"] == "table"}
+    triggers = {r["name"] for r in rows if r["type"] == "trigger"}
+    missing: list[str] = []
+    if "events" in tables:
+        missing += [g for g in _EVENT_GUARDS if g not in triggers]
+    if "curriculum" in tables:
+        missing += [g for g in _CURRICULUM_GUARDS if g not in triggers]
+    if missing:
+        raise IntegrityError(f"guard triggers missing (possible tampering): {sorted(missing)}")
 
 
 def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
-    """Open a connection and ensure the schema + append-only/immutability triggers exist."""
+    """Open a connection, verify guard-trigger integrity, and ensure the schema exists."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    _detect_tampering(conn)
     conn.executescript(_SCHEMA)
     return conn
 
@@ -81,7 +121,8 @@ class EventLog:
     """Append-only event log (store 3).
 
     The public API exposes only ``append`` and read methods -- there is deliberately no update or
-    delete. The SQLite triggers enforce the same property even against raw SQL.
+    delete. The SQLite triggers enforce the same property even against raw SQL UPDATE/DELETE and
+    INSERT OR REPLACE.
     """
 
     def __init__(self, conn: sqlite3.Connection, clock: Clock | None = None) -> None:

@@ -26,7 +26,15 @@ class AuthError(ProviderError):
 
 
 class TransportError(ProviderError):
-    """Network/HTTP/backend failure. Triggers fallback."""
+    """Network/HTTP/backend failure (5xx, timeout, connection). Triggers fallback."""
+
+
+class BadRequestError(ProviderError):
+    """A malformed request (4xx client error). Does NOT trigger fallback -- it is a bug to fix.
+
+    Switching backends would not fix a bad request, and silently falling back would mask the bug
+    (the adapter's contract is to propagate non-auth/non-transport errors).
+    """
 
 
 class NoBackendAvailable(ProviderError):

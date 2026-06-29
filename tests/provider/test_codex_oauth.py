@@ -12,7 +12,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ai_professor.provider.adapter import AuthError, CompletionRequest, Message, TransportError
+from ai_professor.provider.adapter import (
+    AuthError,
+    BadRequestError,
+    CompletionRequest,
+    Message,
+    TransportError,
+)
 from ai_professor.provider.codex_oauth import CodexAuth, CodexBackend, load_codex_auth
 
 
@@ -112,6 +118,20 @@ def test_complete_maps_401_to_auth_error(tmp_path: Path) -> None:
         auth_path=auth, client=httpx.Client(transport=httpx.MockTransport(handler))
     )
     with pytest.raises(AuthError):
+        backend.complete(_req())
+
+
+def test_complete_maps_400_to_bad_request_error(tmp_path: Path) -> None:
+    # A client error is our bug, not a transient/auth failure: it must NOT trigger fallback.
+    auth = _write_auth(tmp_path, access_token="tok")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "malformed input"})
+
+    backend = CodexBackend(
+        auth_path=auth, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    with pytest.raises(BadRequestError):
         backend.complete(_req())
 
 

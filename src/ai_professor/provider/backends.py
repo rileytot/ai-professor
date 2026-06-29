@@ -14,6 +14,7 @@ from typing import Any
 from ai_professor.provider.adapter import (
     AuthError,
     Backend,
+    BadRequestError,
     Completion,
     CompletionRequest,
     LLMProvider,
@@ -53,10 +54,16 @@ class LiteLLMBackend:
         try:
             resp = litellm.completion(model=self._model, messages=messages, **kwargs)
         except Exception as exc:
-            # Both auth and transport failures should trigger fallback; we only label for logs.
-            if "auth" in type(exc).__name__.lower():
-                raise AuthError(str(exc)) from exc
-            raise TransportError(str(exc)) from exc
+            name = type(exc).__name__.lower()
+            if "auth" in name or "permission" in name:
+                raise AuthError(str(exc)) from exc  # fall back
+            if any(
+                k in name for k in ("badrequest", "invalidrequest", "notfound", "unprocessable")
+            ):
+                raise BadRequestError(str(exc)) from exc  # propagate -- our bug, not transient
+            raise TransportError(
+                str(exc)
+            ) from exc  # rate-limit / timeout / connection -> fall back
         text = str(resp.choices[0].message.content or "")
         return Completion(text=text, model=self._model, backend=self.name)
 

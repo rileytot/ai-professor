@@ -22,6 +22,7 @@ import httpx
 
 from ai_professor.provider.adapter import (
     AuthError,
+    BadRequestError,
     Completion,
     CompletionRequest,
     TransportError,
@@ -137,10 +138,13 @@ class CodexBackend:
             resp = client.post(url, json=payload, headers=headers)
         except httpx.HTTPError as exc:
             raise TransportError(f"Codex request failed: {exc}") from exc
-        if resp.status_code in (401, 403):
-            raise AuthError(f"Codex rejected credentials (HTTP {resp.status_code})")
-        if resp.status_code >= 400:
-            raise TransportError(f"Codex HTTP {resp.status_code}")
+        code = resp.status_code
+        if code in (401, 403):
+            raise AuthError(f"Codex rejected credentials (HTTP {code})")  # fall back
+        if code in (408, 429) or code >= 500:
+            raise TransportError(f"Codex HTTP {code}")  # transient/server -> fall back
+        if code >= 400:
+            raise BadRequestError(f"Codex HTTP {code}")  # client error -> propagate (our bug)
         parsed: dict[str, Any] = resp.json()
         return parsed
 

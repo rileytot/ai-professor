@@ -6,6 +6,7 @@ import pytest
 
 from ai_professor.provider.adapter import (
     AuthError,
+    BadRequestError,
     Completion,
     CompletionRequest,
     LLMProvider,
@@ -96,6 +97,16 @@ def test_non_fallback_error_propagates() -> None:
     fallback = FakeBackend("fallback", result=_ok("fallback"))
     provider = LLMProvider([primary, fallback])
     with pytest.raises(ValueError, match="bad request"):
+        provider.complete(_req())
+    assert fallback.calls == 0
+
+
+def test_bad_request_propagates_without_fallback() -> None:
+    # A 4xx client error is a bug; switching backends would mask it, so it must propagate.
+    primary = FakeBackend("primary", error=BadRequestError("malformed"))
+    fallback = FakeBackend("fallback", result=_ok("fallback"))
+    provider = LLMProvider([primary, fallback])
+    with pytest.raises(BadRequestError):
         provider.complete(_req())
     assert fallback.calls == 0
 

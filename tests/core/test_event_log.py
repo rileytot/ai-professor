@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
+from ai_professor.core.errors import IntegrityError
 from ai_professor.core.events import (
     AnswerSubmitted,
     MilestoneConfirmed,
@@ -13,7 +15,7 @@ from ai_professor.core.events import (
     TopicAdvanced,
     TopicStarted,
 )
-from ai_professor.core.stores import EventLog, Stores
+from ai_professor.core.stores import EventLog, Stores, open_stores
 
 
 def test_append_assigns_increasing_seq(stores: Stores) -> None:
@@ -80,3 +82,27 @@ def test_log_api_has_no_mutation_methods() -> None:
     # The append-only property is also reflected in the API surface: no update/delete.
     assert not hasattr(EventLog, "update")
     assert not hasattr(EventLog, "delete")
+
+
+def test_insert_or_replace_is_blocked(stores: Stores) -> None:
+    # INSERT OR REPLACE's conflict-delete skips BEFORE DELETE triggers; a BEFORE INSERT guard
+    # blocks the upsert so it cannot silently overwrite a recorded event.
+    stores.events.append(MilestoneConfirmed(milestone_id="m1", node_id="7.1", proof_id="p1"))
+    with pytest.raises(sqlite3.Error, match="append-only"):
+        stores.conn.execute(
+            "INSERT OR REPLACE INTO events(seq, stream, ts, type, payload) "
+            "VALUES (1, 'default', 't', 'MilestoneConfirmed', '{\"milestone_id\": \"forged\", "
+            '"node_id": "7.1", "proof_id": "x"}\')'
+        )
+
+
+def test_connect_detects_stripped_guard_triggers(tmp_path: Path) -> None:
+    db = tmp_path / "store.sqlite"
+    first = open_stores(db)
+    first.events.append(TopicStarted(node_id="7.1"))
+    first.conn.execute("DROP TRIGGER events_no_update")  # DDL: triggers cannot block this
+    first.conn.commit()
+    first.conn.close()
+    # Reopening detects the stripped guard rather than silently restoring it.
+    with pytest.raises(IntegrityError):
+        open_stores(db)
