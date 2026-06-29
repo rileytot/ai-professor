@@ -1,0 +1,191 @@
+{
+  "version": "univ-physics-v1-ch7",
+  "title": "University Physics Vol. 1, Ch. 7: Work and Kinetic Energy",
+  "nodes": [
+    {
+      "id": "work",
+      "title": "Work",
+      "sections": [
+        "7.1"
+      ],
+      "milestone_ids": [
+        "m-work"
+      ]
+    },
+    {
+      "id": "kinetic-energy",
+      "title": "Kinetic Energy",
+      "sections": [
+        "7.2"
+      ],
+      "milestone_ids": [
+        "m-kinetic-energy"
+      ]
+    },
+    {
+      "id": "work-energy-theorem",
+      "title": "Work-Energy Theorem",
+      "sections": [
+        "7.3"
+      ],
+      "milestone_ids": [
+        "m-work-energy-theorem"
+      ]
+    },
+    {
+      "id": "power",
+      "title": "Power",
+      "sections": [
+        "7.4"
+      ],
+      "milestone_ids": [
+        "m-power"
+      ]
+    }
+  ],
+  "edges": [
+    [
+      "work",
+      "kinetic-energy"
+    ],
+    [
+      "kinetic-energy",
+      "work-energy-theorem"
+    ],
+    [
+      "work-energy-theorem",
+      "power"
+    ],
+    [
+      "work",
+      "work-energy-theorem"
+    ]
+  ],
+  "milestones": [
+    {
+      "id": "m-work",
+      "node_id": "work",
+      "summary": "Compute the work done by constant and variable forces.",
+      "objective_ids": [
+        "7.1-lo-1",
+        "7.1-lo-2"
+      ],
+      "item_ids": [
+        "7.1-item-1"
+      ]
+    },
+    {
+      "id": "m-kinetic-energy",
+      "node_id": "kinetic-energy",
+      "summary": "Compute kinetic energy and evaluate it across reference frames.",
+      "objective_ids": [
+        "7.2-lo-1",
+        "7.2-lo-2"
+      ],
+      "item_ids": [
+        "7.2-item-1"
+      ]
+    },
+    {
+      "id": "m-work-energy-theorem",
+      "node_id": "work-energy-theorem",
+      "summary": "Apply the work-energy theorem in both directions (motion <-> forces).",
+      "objective_ids": [
+        "7.3-lo-1",
+        "7.3-lo-2"
+      ],
+      "item_ids": [
+        "7.3-item-1"
+      ]
+    },
+    {
+      "id": "m-power",
+      "node_id": "power",
+      "summary": "Relate work over time to power and compute power for a force on a moving body.",
+      "objective_ids": [
+        "7.4-lo-1",
+        "7.4-lo-2"
+      ],
+      "item_ids": [
+        "7.4-item-1"
+      ]
+    }
+  ],
+  "objectives": [
+    {
+      "id": "7.1-lo-1",
+      "section": "7.1",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.1, learning objective 1"
+    },
+    {
+      "id": "7.1-lo-2",
+      "section": "7.1",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.1, learning objective 2"
+    },
+    {
+      "id": "7.2-lo-1",
+      "section": "7.2",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.2, learning objective 1"
+    },
+    {
+      "id": "7.2-lo-2",
+      "section": "7.2",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.2, learning objective 2"
+    },
+    {
+      "id": "7.3-lo-1",
+      "section": "7.3",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.3, learning objective 1"
+    },
+    {
+      "id": "7.3-lo-2",
+      "section": "7.3",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.3, learning objective 2"
+    },
+    {
+      "id": "7.4-lo-1",
+      "section": "7.4",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.4, learning objective 1"
+    },
+    {
+      "id": "7.4-lo-2",
+      "section": "7.4",
+      "locator": "OpenStax University Physics Vol. 1 \u00a77.4, learning objective 2"
+    }
+  ],
+  "items": [
+    {
+      "id": "7.1-item-1",
+      "locator": "OpenStax University Physics Vol. 1, Ch. 7 Problems (\u00a77.1 Work)",
+      "cas_verifiable": true
+    },
+    {
+      "id": "7.2-item-1",
+      "locator": "OpenStax University Physics Vol. 1, Ch. 7 Problems (\u00a77.2 Kinetic Energy)",
+      "cas_verifiable": true
+    },
+    {
+      "id": "7.3-item-1",
+      "locator": "OpenStax University Physics Vol. 1, Ch. 7 Problems (\u00a77.3 Work-Energy Theorem)",
+      "cas_verifiable": true
+    },
+    {
+      "id": "7.4-item-1",
+      "locator": "OpenStax University Physics Vol. 1, Ch. 7 Problems (\u00a77.4 Power)",
+      "cas_verifiable": true
+    }
+  ],
+  "entry_node_ids": [
+    "work"
+  ],
+  "terminal_node_ids": [
+    "power"
+  ],
+  "provenance": {
+    "sources": [
+      "OpenStax University Physics Volume 1 (CC BY 4.0)"
+    ],
+    "human_reviewed": true,
+    "notes": "Extract-and-verify (DESIGN.md \u00a712). LOs parsed from source; node clustering and the work->work-energy-theorem cross-edge human-verified. Cross-source diff vs MIT 8.01 found no omissions within Ch 7 scope. Sourced items + CAS templates are specified in Phase 2."
+  }
+}
