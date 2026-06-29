@@ -30,3 +30,18 @@ class UnknownEventType(IntegrityError):
     def __init__(self, type_name: str) -> None:
         super().__init__(f"unknown event type {type_name!r} (not registered via @event)")
         self.type_name = type_name
+
+
+class ProofForgeryError(IntegrityError):
+    """Raised when a milestone is confirmed without a genuinely-minted ``VerifiedProof``.
+
+    The proof is an unforgeable capability token: it can only be minted by the judger's
+    verification path (DESIGN.md §3, invariant #1). A confirmation backed by anything else --
+    a hand-built object, a look-alike, a token minted without the module-private guard -- is a
+    forgery and is refused.
+    """
+
+    def __init__(
+        self, detail: str = "milestone confirmation requires a minted VerifiedProof"
+    ) -> None:
+        super().__init__(detail)
