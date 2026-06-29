@@ -45,6 +45,11 @@ warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 
+# litellm is an optional dependency (the [llm] extra) and ships no type stubs.
+[[tool.mypy.overrides]]
+module = "litellm.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
