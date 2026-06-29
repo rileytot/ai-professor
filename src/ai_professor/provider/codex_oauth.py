@@ -3,19 +3,31 @@
 Consumes the user's existing Codex/ChatGPT auth from ``~/.codex/auth.json`` and calls the Codex
 backend's Responses endpoint, which is stateless (we resend the full history each call) and streams
 the answer as Server-Sent Events. Credentials are password-equivalent: the access token is never
-logged (``repr=False``) and never persisted by us.
+logged (``repr=False``).
 
 This route is UNOFFICIAL and can change. The wire details below were validated live against the
 current Codex backend (June 2026): endpoint ``/backend-api/codex/responses``; ChatGPT-account
 models are ``gpt-5.5`` / ``gpt-5.4`` / ``gpt-5.4-mini`` (NOT the ``*-codex`` names -- those are
-rejected for ChatGPT accounts); the answer text accumulates from ``response.output_text.delta``
-SSE events. They may need revalidation after a Codex update.
+rejected for ChatGPT accounts); the ``originator: codex_cli_rs`` header is required (403 without
+it); the answer accumulates from ``response.output_text.delta`` SSE events. Revalidate after a
+Codex update.
+
+**Token refresh.** The access token is short-lived. We re-read ``auth.json`` each call (so a refresh
+by the Codex app is picked up automatically) and, for long sessions where the Codex app is not
+actively refreshing, refresh it ourselves: proactively when it is within minutes of expiry, and on a
+401. A refresh rotates the refresh token server-side, so we write the rotated token back atomically
+to keep the Codex app working too. (A simultaneous refresh by the Codex app at the same instant is a
+rare edge case -- during a learning session the user is driving this harness, not Codex.)
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import os
+import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +57,11 @@ _STATIC_HEADERS = {
     "Accept": "text/event-stream",
 }
 
+# Token refresh (auth.openai.com). Constants from the openai/codex source.
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+TOKEN_URL = "https://auth.openai.com/oauth/token"
+_REFRESH_WINDOW_S = 5 * 60  # refresh if the access token expires within this many seconds
+
 
 def default_codex_auth_path() -> Path:
     return Path.home() / ".codex" / "auth.json"
@@ -63,15 +80,8 @@ def load_codex_auth(path: Path) -> CodexAuth | None:
 
     Returns ``None`` if the file is absent, unreadable, malformed, or missing an access token.
     """
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
+    data = _read_auth_file(path)
+    if data is None:
         return None
     raw_tokens = data.get("tokens")
     tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
@@ -80,6 +90,93 @@ def load_codex_auth(path: Path) -> CodexAuth | None:
     if not isinstance(access_token, str) or not access_token:
         return None
     return CodexAuth(access_token=access_token, account_id=str(account_id))
+
+
+# --- token refresh -----------------------------------------------------------------------------
+
+
+def _read_auth_file(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_auth_file(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)  # atomic on the same filesystem
+
+
+def _jwt_exp(token: str) -> int | None:
+    """Read the ``exp`` (epoch seconds) claim from a JWT access token, or None if unreadable."""
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    return int(exp) if isinstance(exp, int | float) else None
+
+
+def needs_refresh(
+    access_token: str, *, now: float | None = None, window_s: int = _REFRESH_WINDOW_S
+) -> bool:
+    """True if the token expires within ``window_s`` (False if its expiry can't be read)."""
+    exp = _jwt_exp(access_token)
+    if exp is None:
+        return False
+    return exp - (time.time() if now is None else now) <= window_s
+
+
+def refresh_codex_auth(path: Path, *, client: httpx.Client | None = None) -> CodexAuth | None:
+    """Refresh the access token via auth.openai.com and write the rotated tokens back atomically."""
+    data = _read_auth_file(path)
+    if data is None:
+        return None
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    body = {
+        "client_id": CODEX_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    headers = {"Content-Type": "application/json"}
+    try:
+        if client is not None:
+            resp = client.post(TOKEN_URL, json=body, headers=headers)
+        else:
+            with httpx.Client(timeout=30.0) as owned:
+                resp = owned.post(TOKEN_URL, json=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise TransportError(f"Codex token refresh failed: {exc}") from exc
+    if resp.status_code != 200:
+        raise AuthError(f"Codex token refresh rejected (HTTP {resp.status_code})")
+    new = resp.json()
+    if not isinstance(new, dict):
+        raise AuthError("Codex token refresh returned an unexpected body")
+    for key in ("access_token", "id_token", "refresh_token"):
+        value = new.get(key)
+        if isinstance(value, str) and value:
+            tokens[key] = value
+    data["tokens"] = tokens
+    data["last_refresh"] = datetime.now(UTC).isoformat()
+    _write_auth_file(path, data)
+    return load_codex_auth(path)
+
+
+# --- request/response shaping ------------------------------------------------------------------
 
 
 def _content_part_type(role: str) -> str:
@@ -140,20 +237,51 @@ class CodexBackend:
         model: str = CODEX_DEFAULT_MODEL,
         base_url: str = CODEX_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT_S,
+        refresh: bool = True,
     ) -> None:
         self._auth_path = auth_path if auth_path is not None else default_codex_auth_path()
         self._client = client  # injectable for tests; if None, a client is created per call
         self._model = model
         self._base_url = base_url
         self._timeout = timeout
+        self._refresh = refresh
 
     def available(self) -> bool:
         return load_codex_auth(self._auth_path) is not None
 
     def complete(self, request: CompletionRequest) -> Completion:
+        auth = self._fresh_auth()
+        if auth is None:
+            raise AuthError(
+                f"no Codex credentials at {self._auth_path}; "
+                "sign in via the Codex app or run `codex login`"
+            )
+        payload = self._build_payload(request)
+        url = f"{self._base_url}{RESPONSES_PATH}"
+        if self._client is not None:
+            sse = self._post_with_retry(self._client, url, payload, auth)
+        else:
+            with httpx.Client(timeout=self._timeout) as client:
+                sse = self._post_with_retry(client, url, payload, auth)
+        return Completion(text=parse_sse_text(sse), model=str(payload["model"]), backend=self.name)
+
+    def _fresh_auth(self) -> CodexAuth | None:
         auth = load_codex_auth(self._auth_path)
         if auth is None:
-            raise AuthError(f"no Codex credentials at {self._auth_path}")
+            return None
+        if self._refresh and needs_refresh(auth.access_token):
+            refreshed = self._safe_refresh(self._client)
+            if refreshed is not None:
+                return refreshed
+        return auth
+
+    def _safe_refresh(self, client: httpx.Client | None) -> CodexAuth | None:
+        try:
+            return refresh_codex_auth(self._auth_path, client=client)
+        except (AuthError, TransportError):
+            return None
+
+    def _headers(self, auth: CodexAuth) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {auth.access_token}",
             "Content-Type": "application/json",
@@ -161,14 +289,7 @@ class CodexBackend:
         }
         if auth.account_id:
             headers[ACCOUNT_HEADER] = auth.account_id
-        payload = self._build_payload(request)
-        url = f"{self._base_url}{RESPONSES_PATH}"
-        if self._client is not None:
-            sse = self._post(self._client, url, payload, headers)
-        else:
-            with httpx.Client(timeout=self._timeout) as client:
-                sse = self._post(client, url, payload, headers)
-        return Completion(text=parse_sse_text(sse), model=str(payload["model"]), backend=self.name)
+        return headers
 
     def _build_payload(self, request: CompletionRequest) -> dict[str, Any]:
         system = "\n\n".join(m.content for m in request.messages if m.role == "system")
@@ -193,6 +314,19 @@ class CodexBackend:
             payload["temperature"] = request.temperature
         return payload
 
+    def _post_with_retry(
+        self, client: httpx.Client, url: str, payload: dict[str, Any], auth: CodexAuth
+    ) -> str:
+        try:
+            return self._post(client, url, payload, self._headers(auth))
+        except AuthError:
+            if not self._refresh:
+                raise
+            refreshed = self._safe_refresh(client)
+            if refreshed is None:
+                raise
+            return self._post(client, url, payload, self._headers(refreshed))
+
     def _post(
         self,
         client: httpx.Client,
@@ -206,7 +340,7 @@ class CodexBackend:
             raise TransportError(f"Codex request failed: {exc}") from exc
         code = resp.status_code
         if code in (401, 403):
-            raise AuthError(f"Codex rejected credentials (HTTP {code})")  # fall back
+            raise AuthError(f"Codex rejected credentials (HTTP {code})")  # may refresh + retry
         if code in (408, 429) or code >= 500:
             raise TransportError(f"Codex HTTP {code}")  # transient/server -> fall back
         if code >= 400:

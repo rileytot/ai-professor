@@ -6,6 +6,7 @@ credentials come from a temp file. The mocked SSE mirrors the real (live-validat
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -23,8 +24,17 @@ from ai_professor.provider.codex_oauth import (
     CodexAuth,
     CodexBackend,
     load_codex_auth,
+    needs_refresh,
     parse_sse_text,
+    refresh_codex_auth,
 )
+
+
+def _jwt(exp: int) -> str:
+    """A minimal JWT carrying just an exp claim (signature is irrelevant to our exp reader)."""
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+    return f"h.{payload}.s"
+
 
 # A Responses SSE stream mirroring the live protocol: text accumulates from output_text.delta.
 _SSE_HELLO = (
@@ -208,3 +218,66 @@ def test_complete_maps_network_error_to_transport_error(tmp_path: Path) -> None:
     )
     with pytest.raises(TransportError):
         backend.complete(_req())
+
+
+def test_needs_refresh() -> None:
+    now = 1_000_000.0
+    assert needs_refresh(_jwt(int(now) + 30), now=now) is True  # within the refresh window
+    assert needs_refresh(_jwt(int(now) + 3600), now=now) is False  # comfortably valid
+    assert needs_refresh("not-a-jwt", now=now) is False  # unreadable expiry -> let 401 handle it
+
+
+def test_refresh_codex_auth_rotates_and_writes_back(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {"auth_mode": "chatgpt", "tokens": {"access_token": "old", "refresh_token": "rt1"}}
+        )
+    )
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"access_token": "new", "refresh_token": "rt2"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    auth = refresh_codex_auth(path, client=client)
+
+    assert auth is not None and auth.access_token == "new"
+    assert seen["host"] == "auth.openai.com"
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["grant_type"] == "refresh_token"
+    assert body["refresh_token"] == "rt1"
+    saved = json.loads(path.read_text())
+    assert saved["tokens"]["access_token"] == "new"
+    assert saved["tokens"]["refresh_token"] == "rt2"  # rotation persisted
+    assert saved["auth_mode"] == "chatgpt"  # rest of the structure preserved
+
+
+def test_complete_refreshes_on_401_then_retries(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps({"tokens": {"access_token": "old", "refresh_token": "rt1", "account_id": "a"}})
+    )
+    responses = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "auth.openai.com":
+            return httpx.Response(200, json={"access_token": "new", "refresh_token": "rt2"})
+        responses["n"] += 1
+        if responses["n"] == 1:
+            assert request.headers["Authorization"] == "Bearer old"
+            return httpx.Response(401, json={"error": "expired"})
+        assert request.headers["Authorization"] == "Bearer new"  # retried with the refreshed token
+        return httpx.Response(200, text=_SSE_HELLO)
+
+    backend = CodexBackend(
+        auth_path=path, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    result = backend.complete(_req())
+
+    assert result.text == "Hello"
+    assert responses["n"] == 2
+    assert json.loads(path.read_text())["tokens"]["access_token"] == "new"
