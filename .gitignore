@@ -1,0 +1,46 @@
+# === Copyrighted / local-only content (invariants #7 & #9) ===
+# Source material (e.g. the user's OpenStax copy, rehydrated problem text) NEVER enters the repo.
+# Only structure + locators live under curricula/ (which IS tracked).
+content/
+
+# === Runtime state: event log, knowledge projection, transcripts ===
+# Append-only stores may contain learner data; they are derived/runtime, never committed.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+data/
+var/
+
+# === Secrets / credentials ===
+# OAuth tokens (e.g. Codex auth.json), API keys. Password-equivalent; never logged or committed.
+.env
+.env.*
+*.secret
+**/auth.json
+secrets/
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# === Tooling caches ===
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# === Editor / OS ===
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
